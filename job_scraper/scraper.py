@@ -5,15 +5,28 @@ deduplicates via seen_jobs.json, and sends Telegram messages for new matches.
 """
 
 import os
+import re
 import json
+import time
 import hashlib
 import logging
-import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 import httpx
 import yaml
+
+# ── Source imports ─────────────────────────────────────────────────────────────
+from .sources import (
+    scrape_remoteok,
+    scrape_weworkremotely,
+    scrape_arbeitnow,
+    scrape_adzuna,
+    scrape_reddit,
+    scrape_google_jobs,
+    scrape_hackernews,
+    scrape_jobspy,
+)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -25,8 +38,24 @@ log = logging.getLogger(__name__)
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
-CONFIG_PATH = BASE_DIR / "config.yaml"
-SEEN_JOBS_PATH = BASE_DIR / "seen_jobs.json"
+ROOT_DIR = BASE_DIR.parent
+CONFIG_PATH = ROOT_DIR / "config.yaml"
+SEEN_JOBS_PATH = ROOT_DIR / "seen_jobs.json"
+LAST_RUN_PATH = ROOT_DIR / "last_run.json"
+
+# ── Source Registry ───────────────────────────────────────────────────────────
+# Maps source name → scraping function and default run frequency.
+# Frequencies can be overridden from config.yaml.
+SOURCES = {
+    "remoteok":        {"fn": scrape_remoteok,        "frequency": "every_run"},
+    "weworkremotely":  {"fn": scrape_weworkremotely,  "frequency": "every_run"},
+    "arbeitnow":       {"fn": scrape_arbeitnow,       "frequency": "every_run"},
+    "adzuna":          {"fn": scrape_adzuna,           "frequency": "every_8h"},
+    "reddit":          {"fn": scrape_reddit,           "frequency": "every_run"},
+    "google_jobs":     {"fn": scrape_google_jobs,      "frequency": "daily"},
+    "hackernews":      {"fn": scrape_hackernews,       "frequency": "every_run"},
+    "jobspy":          {"fn": scrape_jobspy,            "frequency": "daily"},
+}
 
 # ── Config ────────────────────────────────────────────────────────────────────
 def load_config() -> dict:
@@ -50,6 +79,33 @@ def job_id(job: dict) -> str:
     """Stable hash from URL or title+company."""
     key = job.get("url") or f"{job.get('title','')}|{job.get('company','')}"
     return hashlib.sha1(key.encode()).hexdigest()
+
+# ── Last-run tracking (smart scheduling) ─────────────────────────────────────
+
+def load_last_runs() -> dict:
+    """Load last-run timestamps for each source from last_run.json."""
+    if LAST_RUN_PATH.exists():
+        try:
+            with open(LAST_RUN_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            log.warning(f"Could not load last_run.json, starting fresh: {e}")
+    return {}
+
+def save_last_runs(last_runs: dict):
+    """Persist last-run timestamps to last_run.json."""
+    with open(LAST_RUN_PATH, "w") as f:
+        json.dump(last_runs, f, indent=2)
+
+def should_run(source_name: str, frequency: str, last_runs: dict) -> bool:
+    """Check if enough time has passed since last run for this source."""
+    intervals = {"every_run": 0, "every_8h": 8 * 3600, "every_12h": 12 * 3600, "daily": 23 * 3600}
+    min_interval = intervals.get(frequency, 0)
+    last = last_runs.get(source_name)
+    if not last:
+        return True
+    elapsed = time.time() - last
+    return elapsed >= min_interval
 
 # ── Matching logic ────────────────────────────────────────────────────────────
 def matches(job: dict, cfg: dict) -> bool:
@@ -107,182 +163,20 @@ def matches(job: dict, cfg: dict) -> bool:
 
     return True
 
-# ── Scrapers ──────────────────────────────────────────────────────────────────
-
-def scrape_remoteok(client: httpx.Client) -> list[dict]:
-    """RemoteOK public JSON API — no key required."""
-    log.info("Scraping RemoteOK...")
-    try:
-        r = client.get(
-            "https://remoteok.com/api",
-            headers={"User-Agent": "JobScraper/1.0 (+github-actions)"},
-            timeout=20,
-        )
-        r.raise_for_status()
-        data = r.json()
-        jobs = []
-        for item in data:
-            if not isinstance(item, dict) or not item.get("position"):
-                continue
-            jobs.append({
-                "source": "RemoteOK",
-                "title": item.get("position", ""),
-                "company": item.get("company", ""),
-                "location": item.get("location", "Remote"),
-                "url": item.get("url", f"https://remoteok.com/remote-jobs/{item.get('id','')}"),
-                "tags": item.get("tags", []),
-                "description": item.get("description", ""),
-                "remote": True,
-                "salary_min": None,
-                "posted_at": item.get("date", ""),
-            })
-        log.info(f"  RemoteOK: {len(jobs)} listings fetched")
-        return jobs
-    except Exception as e:
-        log.warning(f"  RemoteOK failed: {e}")
-        return []
-
-
-def scrape_weworkremotely(client: httpx.Client) -> list[dict]:
-    """We Work Remotely — public RSS feeds."""
-    log.info("Scraping WeWorkRemotely...")
-    feeds = [
-        ("https://weworkremotely.com/categories/remote-programming-jobs.rss", "Programming"),
-        ("https://weworkremotely.com/categories/remote-devops-sysadmin-jobs.rss", "DevOps"),
-        ("https://weworkremotely.com/categories/remote-design-jobs.rss", "Design"),
-        ("https://weworkremotely.com/remote-jobs.rss", "All"),
-    ]
-    jobs = []
-    for url, category in feeds:
-        try:
-            r = client.get(url, timeout=20)
-            r.raise_for_status()
-            root = ET.fromstring(r.content)
-            for item in root.findall(".//item"):
-                def tag(name):
-                    el = item.find(name)
-                    return el.text.strip() if el is not None and el.text else ""
-
-                title_full = tag("title")  # "Company: Job Title"
-                parts = title_full.split(":", 1)
-                company = parts[0].strip() if len(parts) > 1 else ""
-                title   = parts[1].strip() if len(parts) > 1 else title_full
-
-                jobs.append({
-                    "source": "WeWorkRemotely",
-                    "title": title,
-                    "company": company,
-                    "location": "Remote",
-                    "url": tag("link") or tag("guid"),
-                    "tags": [category.lower()],
-                    "description": tag("description"),
-                    "remote": True,
-                    "salary_min": None,
-                    "posted_at": tag("pubDate"),
-                })
-        except Exception as e:
-            log.warning(f"  WWR feed {url} failed: {e}")
-    log.info(f"  WeWorkRemotely: {len(jobs)} listings fetched")
-    return jobs
-
-
-def scrape_arbeitnow(client: httpx.Client) -> list[dict]:
-    """Arbeitnow — free public JSON API, no key required."""
-    log.info("Scraping Arbeitnow...")
-    jobs = []
-    page = 1
-    try:
-        while page <= 3:  # cap at 3 pages = ~75 jobs
-            r = client.get(
-                "https://www.arbeitnow.com/api/job-board-api",
-                params={"page": page},
-                timeout=20,
-            )
-            r.raise_for_status()
-            data = r.json().get("data", [])
-            if not data:
-                break
-            for item in data:
-                jobs.append({
-                    "source": "Arbeitnow",
-                    "title": item.get("title", ""),
-                    "company": item.get("company_name", ""),
-                    "location": item.get("location", ""),
-                    "url": item.get("url", ""),
-                    "tags": item.get("tags", []),
-                    "description": item.get("description", ""),
-                    "remote": item.get("remote", False),
-                    "salary_min": None,
-                    "posted_at": item.get("created_at", ""),
-                })
-            page += 1
-    except Exception as e:
-        log.warning(f"  Arbeitnow failed: {e}")
-    log.info(f"  Arbeitnow: {len(jobs)} listings fetched")
-    return jobs
-
-
-def scrape_adzuna(client: httpx.Client, cfg: dict) -> list[dict]:
-    """
-    Adzuna — free API key required.
-    Sign up at https://developer.adzuna.com (free, generous limits).
-    Set ADZUNA_APP_ID and ADZUNA_APP_KEY in GitHub Secrets.
-    """
-    app_id  = os.getenv("ADZUNA_APP_ID")
-    app_key = os.getenv("ADZUNA_APP_KEY")
-    if not app_id or not app_key:
-        log.warning("  Adzuna skipped — ADZUNA_APP_ID / ADZUNA_APP_KEY not set")
-        return []
-
-    log.info("Scraping Adzuna...")
-    # Build a keyword query from config
-    query = " OR ".join(cfg.get("keywords", [])[:5]) or "software engineer"
-    country = "in"  # change to gb, us, au, etc.
-
-    jobs = []
-    try:
-        r = client.get(
-            f"https://api.adzuna.com/v1/api/jobs/{country}/search/1",
-            params={
-                "app_id": app_id,
-                "app_key": app_key,
-                "what": query,
-                "content-type": "application/json",
-                "results_per_page": 50,
-                "sort_by": "date",
-            },
-            timeout=20,
-        )
-        r.raise_for_status()
-        for item in r.json().get("results", []):
-            sal = item.get("salary_min")
-            jobs.append({
-                "source": "Adzuna",
-                "title": item.get("title", ""),
-                "company": item.get("company", {}).get("display_name", ""),
-                "location": item.get("location", {}).get("display_name", ""),
-                "url": item.get("redirect_url", ""),
-                "tags": [item.get("category", {}).get("label", "")],
-                "description": item.get("description", ""),
-                "remote": "remote" in (item.get("title") or "").lower(),
-                "salary_min": int(sal) if sal else None,
-                "posted_at": item.get("created", ""),
-            })
-    except Exception as e:
-        log.warning(f"  Adzuna failed: {e}")
-    log.info(f"  Adzuna: {len(jobs)} listings fetched")
-    return jobs
-
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
-def format_message(job: dict, cfg: dict) -> str:
-    """Build a nicely formatted Telegram message (MarkdownV2)."""
-    def esc(text: str) -> str:
-        """Escape special chars for Telegram MarkdownV2."""
-        for ch in r"\_*[]()~`>#+-=|{}.!":
-            text = text.replace(ch, f"\\{ch}")
-        return text
+def esc(text: str) -> str:
+    """Escape special chars for Telegram MarkdownV2."""
+    for ch in r"\_*[]()~`>#+-=|{}.!":
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
+
+def format_single_message(job: dict, cfg: dict) -> str:
+    """Build a nicely formatted Telegram message (MarkdownV2) for a single job.
+
+    Kept for backward compatibility — previously named format_message().
+    """
     title   = esc(job.get("title", "Unknown Role"))
     company = esc(job.get("company", "Unknown Company"))
     loc     = esc(job.get("location", "Remote"))
@@ -306,7 +200,6 @@ def format_message(job: dict, cfg: dict) -> str:
         snip_len = cfg.get("description_snippet_length", 280)
         raw_desc = job["description"]
         # Strip basic HTML tags
-        import re
         clean = re.sub(r"<[^>]+>", " ", raw_desc)
         clean = re.sub(r"\s+", " ", clean).strip()[:snip_len]
         if len(raw_desc) > snip_len:
@@ -320,6 +213,72 @@ def format_message(job: dict, cfg: dict) -> str:
     lines.append(f"_via {source}_")
 
     return "\n".join(lines)
+
+
+# Backward-compatible alias
+format_message = format_single_message
+
+
+def format_digest(jobs: list[dict], cfg: dict) -> list[str]:
+    """Format jobs into digest-style Telegram messages (MarkdownV2).
+
+    Groups up to max_jobs_per_digest jobs per message.
+    Returns a list of message strings, each under the 4096-char Telegram limit.
+    """
+    max_per_digest = cfg.get("max_jobs_per_digest", 10)
+    ist = timezone(timedelta(hours=5, minutes=30))
+    now_ist = datetime.now(ist).strftime("%Y\\-%m\\-%d %H:%M IST")
+
+    messages = []
+    chunks = [jobs[i:i + max_per_digest] for i in range(0, len(jobs), max_per_digest)]
+
+    for chunk_idx, chunk in enumerate(chunks):
+        total_label = len(jobs) if len(chunks) == 1 else f"{len(jobs)} total, part {chunk_idx + 1}"
+        header = (
+            f"🔔 *Job Alert — {esc(str(len(chunk)))} New Matches*\n"
+            f"📅 {now_ist}\n"
+        )
+
+        entries = []
+        number_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+        for i, job in enumerate(chunk):
+            emoji = number_emojis[i] if i < len(number_emojis) else f"*{i + 1}\\.*"
+            title   = esc(job.get("title", "Unknown Role"))
+            company = esc(job.get("company", "Unknown Company"))
+            loc     = esc(job.get("location", "Remote"))
+            source  = esc(job.get("source", ""))
+            url     = job.get("url", "")
+
+            entry_lines = [
+                "━━━━━━━━━━━━━━━━━━━",
+                f"{emoji} *{title}*",
+                f"🏢 {company} \\| 📍 {loc}",
+            ]
+
+            if job.get("salary_min"):
+                sal = esc(f"${job['salary_min']:,}+")
+                entry_lines.append(f"💰 {sal}")
+
+            entry_lines.append(f"🔗 [Apply →]({url})")
+            entry_lines.append(f"_via {source}_")
+
+            entries.append("\n".join(entry_lines))
+
+        full_msg = header + "\n" + "\n\n".join(entries)
+
+        # Split further if the message exceeds Telegram's 4096 char limit
+        if len(full_msg) <= 4096:
+            messages.append(full_msg)
+        else:
+            # Fallback: send entries individually with a mini-header
+            for entry in entries:
+                mini_msg = header + "\n" + entry
+                if len(mini_msg) > 4096:
+                    # Truncate if a single entry is somehow too long
+                    mini_msg = mini_msg[:4090] + "\\.\\.\\."
+                messages.append(mini_msg)
+
+    return messages
 
 
 def send_telegram(message: str, token: str, chat_id: str, client: httpx.Client):
@@ -341,7 +300,8 @@ def send_telegram(message: str, token: str, chat_id: str, client: httpx.Client):
 
 
 def send_summary(count: int, token: str, chat_id: str, client: httpx.Client):
-    ts = datetime.utcnow().strftime("%Y\\-%-m\\-%-d %H:%M UTC")
+    ist = timezone(timedelta(hours=5, minutes=30))
+    ts = datetime.now(ist).strftime("%Y\\-%m\\-%d %H:%M IST")
     msg = f"✅ *Job Scraper* — {ts}\n_{count} new job{'s' if count != 1 else ''} found and sent\\._"
     send_telegram(msg, token, chat_id, client)
 
@@ -351,9 +311,10 @@ def send_summary(count: int, token: str, chat_id: str, client: httpx.Client):
 def main():
     cfg = load_config()
     seen = load_seen()
+    last_runs = load_last_runs()
 
-    token   = os.environ.get("TELEGRAM_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    token   = (os.environ.get("TELEGRAM_TOKEN") or "").strip()
+    chat_id = (os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
 
     if not token or not chat_id:
         log.error("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID not set — aborting")
@@ -361,21 +322,48 @@ def main():
 
     sources_cfg = cfg.get("sources", {})
     max_notif = cfg.get("max_notifications_per_run", 10)
+    notification_style = cfg.get("notification_style", "digest")
 
     all_jobs: list[dict] = []
 
     with httpx.Client(follow_redirects=True) as client:
-        if sources_cfg.get("remoteok"):
-            all_jobs.extend(scrape_remoteok(client))
-        if sources_cfg.get("weworkremotely"):
-            all_jobs.extend(scrape_weworkremotely(client))
-        if sources_cfg.get("arbeitnow"):
-            all_jobs.extend(scrape_arbeitnow(client))
-        if sources_cfg.get("adzuna"):
-            all_jobs.extend(scrape_adzuna(client, cfg))
+        # ── Scrape each enabled + due source ──────────────────────────────
+        for name, registry_entry in SOURCES.items():
+            src_cfg = sources_cfg.get(name, {})
+
+            # Handle both old format (bool) and new format (dict with enabled/frequency)
+            if isinstance(src_cfg, bool):
+                enabled = src_cfg
+                frequency = registry_entry["frequency"]
+            elif isinstance(src_cfg, dict):
+                enabled = src_cfg.get("enabled", False)
+                frequency = src_cfg.get("frequency", registry_entry["frequency"])
+            else:
+                enabled = False
+                frequency = registry_entry["frequency"]
+
+            if not enabled:
+                log.info(f"  ⏭ {name}: disabled in config")
+                continue
+
+            if not should_run(name, frequency, last_runs):
+                log.info(f"  ⏭ {name}: skipped (frequency={frequency}, not due yet)")
+                continue
+
+            log.info(f"  ▶ Running source: {name} (frequency={frequency})")
+            try:
+                scrape_fn = registry_entry["fn"]
+                jobs = scrape_fn(client, cfg)
+                all_jobs.extend(jobs)
+                # Update last-run timestamp on success
+                last_runs[name] = time.time()
+                log.info(f"  ✓ {name}: {len(jobs)} listings fetched")
+            except Exception as e:
+                log.error(f"  ✗ {name} failed: {e}")
 
         log.info(f"Total listings fetched: {len(all_jobs)}")
 
+        # ── Filter and dedup ──────────────────────────────────────────────
         new_matches: list[dict] = []
         for job in all_jobs:
             jid = job_id(job)
@@ -395,21 +383,32 @@ def main():
         if len(new_matches) > max_notif:
             log.info(f"Capped at {max_notif} notifications (config: max_notifications_per_run)")
 
-        for job in capped:
-            msg = format_message(job, cfg)
-            send_telegram(msg, token, chat_id, client)
-            log.info(f"  Sent: [{job['source']}] {job['title']} @ {job['company']}")
-
+        # ── Send notifications ────────────────────────────────────────────
         if capped:
+            if notification_style == "digest":
+                digest_msgs = format_digest(capped, cfg)
+                for msg in digest_msgs:
+                    send_telegram(msg, token, chat_id, client)
+                log.info(f"  Sent digest: {len(capped)} jobs in {len(digest_msgs)} message(s)")
+            else:
+                # Individual messages (legacy behavior)
+                for job in capped:
+                    msg = format_single_message(job, cfg)
+                    send_telegram(msg, token, chat_id, client)
+                    log.info(f"  Sent: [{job['source']}] {job['title']} @ {job['company']}")
+
             send_summary(len(capped), token, chat_id, client)
         elif cfg.get("notify_on_no_results"):
-            ts = datetime.utcnow().strftime("%Y\\-%-m\\-%-d %H:%M UTC")
+            ist = timezone(timedelta(hours=5, minutes=30))
+            ts = datetime.now(ist).strftime("%Y\\-%m\\-%d %H:%M IST")
             send_telegram(
                 f"🔍 *Job Scraper* — {ts}\n_No new matching jobs this run\\._",
-                token, chat_id, client
+                token, chat_id, client,
             )
 
+    # ── Persist state ─────────────────────────────────────────────────────
     save_seen(seen)
+    save_last_runs(last_runs)
     log.info("Done.")
 
 

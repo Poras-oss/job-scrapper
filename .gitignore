@@ -1,0 +1,49 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+$py.class
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+pip-wheel-metadata/
+
+# Pytest
+.pytest_cache/
+
+# IDEs and editors
+.vscode/
+.idea/
+
+# Environment and secrets
+.env
+.env.*
+credentials
+*.pem
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and databases
+*.log
+*.sqlite3
+
+# Local data
+tweets.json
+
+# Coverage
+htmlcov/
+.coverage
+
+# Mypy cache
+.mypy_cache/
+
+# Compiled extensions
+*.so
