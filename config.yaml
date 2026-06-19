@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────
+#  Job Scraper — User Preferences
+#  Edit this file to control what jobs you get notified about.
+#  No code changes needed.
+# ─────────────────────────────────────────────
+
+# Keywords that must appear in the job title or description (case-insensitive).
+# A job matches if ANY of these keywords match (OR logic).
+# To require multiple keywords, use a phrase: "senior python" instead of two items.
+keywords:
+  - python
+  - fastapi
+  - langchain
+  - langgraph
+  - backend engineer
+  - ai engineer
+  - machine learning engineer
+  - llm
+  - node.js
+
+# Job title must match at least one of these role types (substring match, optional).
+# Leave empty [] to skip this filter.
+role_types:
+  - engineer
+  - developer
+  - backend
+  - ml
+  - ai
+
+# ─── Location filter ─────────────────────────
+# Set remote_only: true to only get remote jobs.
+# If remote_only is false, location_keywords filters by city/country string.
+remote_only: true
+location_keywords: []
+  # - india
+  # - bangalore
+  # - remote
+
+# ─── Salary filter (optional) ─────────────────
+# Only notify if the job posts a salary AND it meets the minimum.
+# Set to 0 to disable. Currency varies by source — treat as approximate signal.
+min_salary: 0          # e.g. 80000
+salary_currency: "USD" # informational only — not converted
+
+# ─── Experience level ─────────────────────────
+# Leave empty [] to get all levels.
+# Options: junior, mid, senior, lead, staff, principal, any
+experience_levels:
+  - mid
+  - senior
+  - lead
+
+# ─── Tag / category filter (RemoteOK uses tags) ───
+# Leave empty [] to skip.
+tags:
+  - python
+  - backend
+  - api
+  - devops
+  - ai
+
+# ─── Sources to enable ────────────────────────
+# Comment out any source you don't want.
+sources:
+  remoteok: true         # remoteok.com — public JSON API, no key needed
+  weworkremotely: true   # weworkremotely.com — public RSS feed, no key needed
+  arbeitnow: true        # arbeitnow.com — public JSON API, no key needed
+  adzuna: false          # adzuna.com — free API key required (https://developer.adzuna.com)
+  github_jobs_rss: false # GitHub's job board RSS (limited, but free)
+
+# ─── Notification settings ────────────────────
+# Max jobs to notify per run (prevents flooding on first run)
+max_notifications_per_run: 10
+
+# Include job description snippet in the Telegram message?
+include_description_snippet: true
+description_snippet_length: 280  # characters
+
+# Send a "no new jobs found" message if nothing matched?
+notify_on_no_results: false
