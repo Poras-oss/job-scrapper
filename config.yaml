@@ -27,6 +27,7 @@ role_types:
   - engineer
   - developer
   - backend
+  - frontend
   - ml
   - ai
 
@@ -53,7 +54,7 @@ location_keywords:
 # Only notify if the job posts a salary AND it meets the minimum.
 # Set to 0 to disable. Currency varies by source — treat as approximate signal.
 min_salary: 0          # e.g. 80000
-salary_currency: "USD" # informational only — not converted
+salary_currency: "INR" # informational only — not converted
 
 # ─── Experience level ─────────────────────────
 # Leave empty [] to get all levels.
